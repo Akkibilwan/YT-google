@@ -1,33 +1,14 @@
-# Core framework
 streamlit
-
-# Data manipulation and numerical operations
 pandas
 numpy
-scipy         # Used for signal processing (find_peaks)
-
-# API interaction and web requests
-requests      # For YouTube API calls
-openai        # For Whisper transcription and AI analysis
-isodate       # For parsing ISO 8601 durations (YouTube API)
-
-# YouTube specific libraries
-youtube-transcript-api # For fetching transcripts
-yt-dlp        # For downloading audio/video (Whisper fallback, snippets)
-
-# Image and Video processing
-opencv-python # For image analysis (retention peaks)
-matplotlib    # For plotting retention profile
-imageio-ffmpeg # Provides ffmpeg path needed by yt-dlp and snippeting
-
-# Browser automation for retention analysis
+scipy
+requests
+openai
+isodate
+youtube-transcript-api
+yt-dlp
+opencv-python
+matplotlib
+imageio-ffmpeg
 selenium
-webdriver-manager # To manage chromedriver
-
-# Note: Standard libraries like os, time, json, logging, hashlib, re,
-# datetime, sqlite3, subprocess, tempfile, shutil, io, atexit, collections
-# are built into Python and do not need to be listed here.
-
-# IMPORTANT: For deployment, consider pinning specific versions
-# (e.g., streamlit==1.28.0) for better reproducibility. You can generate
-# pinned versions using 'pip freeze > requirements.txt' in your working environment.
+webdriver-manager
