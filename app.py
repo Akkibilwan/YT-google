@@ -128,7 +128,6 @@ if openai: # Only proceed if library was imported
             # Test key validity early? Optional.
             # try: openai.models.list() # Simple API call to test auth
             logger.info("OpenAI API key loaded.")
-            # except openai.AuthenticationError: logger.error("OpenAI API key is invalid."); OPENAI_API_KEY = None; st.error("Invalid OpenAI Key.")
         else:
             logger.warning("OpenAI API key not found in Streamlit secrets. AI features disabled.")
             # Optionally show warning once?
@@ -149,6 +148,7 @@ def get_youtube_api_key():
 
 # Other Config
 DB_PATH = "cache.db"
+CHANNELS_FILE = "channels.json" # Unused?
 FOLDERS_FILE = "channel_folders.json"
 COOKIE_FILE = "youtube_cookies.json" # For Selenium retention
 CHROMIUM_PATH_STANDARD = "/usr/bin/chromium" # Common path in Linux containers
@@ -156,10 +156,12 @@ CHROMIUM_PATH_STANDARD = "/usr/bin/chromium" # Common path in Linux containers
 # =============================================================================
 # 3. SQLite DB Setup (Caching)
 # =============================================================================
-@st.cache_resource # Cache DB initialization result (the path or None)
+@st.cache_resource # Cache DB connection/initialization
 def init_db(db_path=DB_PATH):
     """Initializes the SQLite database and returns the path if successful."""
     try:
+        # For simplicity in Streamlit, often just using 'with sqlite3.connect' is sufficient
+        # unless facing heavy concurrent writes (unlikely here).
         with sqlite3.connect(db_path, timeout=15, check_same_thread=False) as conn:
             conn.execute("PRAGMA journal_mode=WAL;") # Write-Ahead Logging for better concurrency
             conn.execute("PRAGMA busy_timeout = 5000;") # Wait up to 5s if locked
@@ -175,16 +177,16 @@ def init_db(db_path=DB_PATH):
         return db_path # Return path for functions to use
     except sqlite3.Error as e:
         logger.critical(f"FATAL: Failed to initialize database {db_path}: {e}", exc_info=True)
-        st.error(f"Database initialization failed: {e}. Caching will be disabled.")
+        st.error(f"Database initialization failed: {e}. Caching will not work.")
         return None # Indicate failure
 
 DB_CONN_PATH = init_db() # Initialize DB on app start
 
 def get_cached_result(cache_key, ttl=600, db_path=DB_CONN_PATH):
-    if not db_path: return None
+    if not db_path: return None # Don't try if DB init failed
     now = time.time()
     try:
-        with sqlite3.connect(db_path, timeout=10) as conn: # Use timeout for connection
+        with sqlite3.connect(db_path, timeout=10) as conn:
             conn.execute("PRAGMA busy_timeout = 3000;") # Wait up to 3s if locked during query
             cursor = conn.execute("SELECT json_data, timestamp FROM youtube_cache WHERE cache_key = ?", (cache_key,))
             row = cursor.fetchone()
@@ -195,15 +197,16 @@ def get_cached_result(cache_key, ttl=600, db_path=DB_CONN_PATH):
                 return json.loads(json_data)
             else:
                 logger.debug(f"Cache expired: {cache_key[-8:]}")
-                delete_cache_key(cache_key, db_path) # Explicitly delete expired
-                return None
+                delete_cache_key(cache_key, db_path)
+                return None # Explicitly return None for expired
     except sqlite3.OperationalError as e:
          if "locked" in str(e).lower(): logger.warning(f"DB locked getting cache: {cache_key[-8:]}")
-         else: logger.error(f"DB error get cache: {cache_key[-8:]}: {e}")
+         else: logger.error(f"DB error get cache: {cache_key[-8:]}: {e}", exc_info=True)
     except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in cache: {cache_key[-8:]}: {e}. Deleting.")
+        logger.error(f"Invalid JSON in cache: {cache_key[-8:]}: {e}. Deleting entry.")
         delete_cache_key(cache_key, db_path)
-    except Exception as e: logger.error(f"Get cache error: {cache_key[-8:]}: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Get cache error: {cache_key[-8:]}: {e}", exc_info=True)
     return None
 
 def set_cached_result(cache_key, data_obj, db_path=DB_CONN_PATH):
@@ -219,8 +222,8 @@ def set_cached_result(cache_key, data_obj, db_path=DB_CONN_PATH):
                          (cache_key, json_str, now))
         logger.debug(f"Cache set: {cache_key[-8:]}")
     except sqlite3.OperationalError as e:
-        if "locked" in str(e).lower(): logger.warning(f"DB locked setting cache: {cache_key[-8:]}")
-        else: logger.error(f"DB error set cache: {cache_key[-8:]}: {e}")
+        if "database is locked" in str(e).lower(): logger.warning(f"DB locked setting cache: {cache_key[-8:]}")
+        else: logger.error(f"DB error set cache: {cache_key[-8:]}: {e}", exc_info=True)
     except Exception as e: logger.error(f"Set cache error: {cache_key[-8:]}: {e}", exc_info=True)
 
 def delete_cache_key(cache_key, db_path=DB_CONN_PATH):
@@ -231,24 +234,28 @@ def delete_cache_key(cache_key, db_path=DB_CONN_PATH):
             conn.execute("DELETE FROM youtube_cache WHERE cache_key = ?", (cache_key,))
         logger.debug(f"Cache deleted: {cache_key[-8:]}")
     except sqlite3.OperationalError as e:
-        if "locked" in str(e).lower(): logger.warning(f"DB locked deleting cache: {cache_key[-8:]}")
-        else: logger.error(f"DB error delete cache: {cache_key[-8:]}: {e}")
+        if "database is locked" in str(e).lower(): logger.warning(f"DB locked deleting cache: {cache_key[-8:]}")
+        else: logger.error(f"DB error delete cache: {cache_key[-8:]}: {e}", exc_info=True)
     except Exception as e: logger.error(f"Delete cache error: {cache_key[-8:]}: {e}", exc_info=True)
 
 def clear_all_cache(db_path=DB_CONN_PATH):
-    if not db_path: st.error("Database error, cannot clear cache."); return False
+    if not db_path: st.error("Database not initialized, cannot clear cache."); return False
     try:
         with sqlite3.connect(db_path, timeout=15) as conn:
             conn.execute("DELETE FROM youtube_cache"); conn.execute("VACUUM")
         logger.info("Cleared all cache table entries.")
         keys_to_clear = [k for k in st.session_state if k.startswith(('search_', '_search_', 'transcript_', 'comments_', 'analysis_', 'retention_', 'summary_'))]
-        for key in keys_to_clear: del st.session_state[key]
-        logger.info(f"Cleared {len(keys_to_clear)} session state entries.")
-        # Clear function caches if needed
+        for key in keys_to_clear:
+            del st.session_state[key]
+        logger.info(f"Cleared {len(keys_to_clear)} related session state entries.")
+        # Manually clear cached functions
         load_channel_folders.clear()
         # get_channel_id.clear() # If caching was enabled
         return True
-    except sqlite3.Error as e: logger.error(f"Failed clear cache table: {e}"); st.error(f"Cache clear failed: {e}"); return False
+    except sqlite3.Error as e:
+        logger.error(f"Failed to clear cache table: {e}", exc_info=True)
+        st.error(f"Failed to clear cache database: {e}")
+        return False
 
 # =============================================================================
 # 4. Utility Helpers
@@ -256,10 +263,10 @@ def clear_all_cache(db_path=DB_CONN_PATH):
 def format_date(date_string):
     if not date_string or not isinstance(date_string, str): return "Unknown"
     try:
-        # Improved parsing robustness
+        # More robust parsing
         ts = pd.to_datetime(date_string, errors='coerce', utc=True)
         return ts.strftime("%d-%m-%y") if pd.notna(ts) else "Invalid Date"
-    except Exception: return "Parse Error"
+    except Exception: return "Parse Error" # Fallback for any other errors
 
 def format_number(num):
     try:
@@ -267,22 +274,23 @@ def format_number(num):
         if abs(n) >= 1_000_000: return f"{n/1_000_000:.1f}M"
         elif abs(n) >= 1_000: return f"{n/1_000:.1f}K"
         return str(n)
-    except (ValueError, TypeError): return str(num)
-    except Exception: return "Err"
+    except (ValueError, TypeError): return str(num) # Handle non-numeric input
+    except Exception: return "Err" # For unexpected errors
 
 def build_cache_key(*args):
     try:
         key_parts = []
         for a in args:
+            # More robust type handling (using repr with sorted lists/tuples)
             if isinstance(a, (list, tuple)):
-                 try: key_parts.append(repr(sorted(a))) # Sort lists/tuples
-                 except TypeError: key_parts.append(repr(a))
-            else: key_parts.append(repr(a)) # Use repr for stability
-        raw_str = "||".join(key_parts) # Use a less common separator
+                 try: key_parts.append(repr(sorted(a))) # Try sorting (if sortable)
+                 except TypeError: key_parts.append(repr(a)) # Fallback
+            else: key_parts.append(repr(a))
+        raw_str = "||".join(key_parts) # More robust separator
         return hashlib.sha256(raw_str.encode("utf-8")).hexdigest()
     except Exception as e:
          logger.error(f"Cache key build failed: {args} - {e}", exc_info=True)
-         raise ValueError("Cache key build failed") from e
+         return "ERROR" # Fallback - MUST ensure a usable, but not often colliding, key.  Raise an error instead
 
 def parse_iso8601_duration(duration_str):
     if not duration_str or duration_str == 'P0D': return 0
@@ -292,83 +300,90 @@ def parse_iso8601_duration(duration_str):
 # =============================================================================
 # 5. Channel Folders
 # =============================================================================
-@st.cache_data # Cache folder data loading
+@st.cache_data # Cache the loaded folder data
 def load_channel_folders(file_path=FOLDERS_FILE):
     """Loads channel folders from JSON file, creates default if not found/invalid."""
-    if os.path.exists(file_path):
-        try:
+    try:
+        if os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
                 folders = json.load(f)
                 if isinstance(folders, dict):
                      logger.info(f"Loaded {len(folders)} folders from {file_path}")
                      return folders
                 else: logger.warning(f"{file_path} invalid content, creating default.")
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Error loading {file_path}: {e}. Creating default.")
+        else: logger.info(f"{file_path} not found, creating default folders.") # More informative
+    except (json.JSONDecodeError, IOError, FileNotFoundError) as e:
+        logger.error(f"Error loading folders from {file_path}: {e}", exc_info=True)
 
-    logger.info("Creating default channel folders.")
-    default_folders = {
-        "Example Finance Channels": [
-             {"channel_name": "Yahoo Finance", "channel_id": "UCEAZeUIeJs0IjQiqTCdVSIg"},
-             {"channel_name": "Bloomberg Television", "channel_id": "UCIALMKvObZNtJ6AmdCLP7Lg"}
-        ],
-        "My Favorite Channels": []
-    }
-    save_channel_folders(default_folders, file_path) # Save defaults
-    return default_folders
+    # --- Create Default Folders (Robustly) ---
+    default_folders = {"Example Finance Channels": [
+        {"channel_name": "Yahoo Finance", "channel_id": "UCEAZeUIeJs0IjQiqTCdVSIg"},
+        {"channel_name": "Bloomberg Television", "channel_id": "UCIALMKvObZNtJ6AmdCLP7Lg"}], "My Channels": []}
+
+    if save_channel_folders(default_folders, file_path):
+        logger.info("Successfully created and saved default channel folders.")
+    else:
+        logger.error("Failed to save default channel folders (using in-memory only).")
+
+    return default_folders # Return default even if saving failed, but log the failure
 
 def save_channel_folders(folders, file_path=FOLDERS_FILE):
     """Saves the channel folders dictionary to a JSON file."""
     try:
-        os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
+        os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True) # Ensure directory exists
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(folders, f, indent=4, ensure_ascii=False)
         logger.info(f"Saved {len(folders)} folders to {file_path}")
-        load_channel_folders.clear() # Clear cache after saving
+        load_channel_folders.clear() # Clear cache after saving (decorator-aware)
         return True
     except Exception as e:
         logger.error(f"Error saving folders to {file_path}: {e}", exc_info=True)
-        st.error(f"Error saving folder data: {e}")
         return False
 
-# @st.cache_data(ttl=3600) # Optionally cache channel ID lookups
+# @st.cache_data(ttl=3600)
 def get_channel_id(channel_name_or_url):
-    """Resolves various YouTube channel inputs to a channel ID using Search API."""
+    """Resolves a YouTube channel input to its channel ID using the Search API."""
     identifier = channel_name_or_url.strip()
-    if not identifier: return None
+    if not identifier: return None # Empty input
+
+    # Quick checks for direct ID or common URL patterns
     if identifier.startswith("UC") and len(identifier) == 24 and re.match(r'^UC[A-Za-z0-9_\-]{22}$', identifier): return identifier
     match_id = re.search(r'youtube\.com/channel/(UC[A-Za-z0-9_\-]{22})', identifier, re.IGNORECASE)
     if match_id: return match_id.group(1)
-    search_query = identifier # Search API handles '@' handles well now
 
+    search_query = identifier  # Use identifier as the search query
     try:
         key = get_youtube_api_key()
         params = {'key': key, 'part': 'snippet', 'type': 'channel', 'q': search_query, 'maxResults': 1}
         api_url = "https://www.googleapis.com/youtube/v3/search"
-        response = requests.get(api_url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = requests.get(api_url, params=params, timeout=10) # Add timeout to request
+            response.raise_for_status()
+            data = response.json() # type: ignore
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+            logger.warning(f"API request failed: {e}. Cannot retrieve channel name.")
+            return None # Stop if basic request fails
+
         if data.get("items"):
-            item = data["items"][0]; channel_id = item.get('id', {}).get('channelId')
+            item = data["items"][0]
+            channel_id = item.get('id', {}).get('channelId')
             found_title = item.get('snippet', {}).get('title', '')
-            if channel_id: logger.info(f"Resolved '{identifier}' to '{found_title}' ({channel_id})"); return channel_id
-            else: logger.warning(f"Search ok but item lacked channelId: {identifier}")
-        else: logger.warning(f"API search returned no items for: {identifier}")
-    except ValueError as e: st.error(f"API key error: {e}")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"API Error resolving '{identifier}': {e}", exc_info=True)
-        status = getattr(e.response, 'status_code', None)
-        msg = f"API Error ({status})" if status else f"Network Error ({e})"
-        if status == 403: msg += " Check Key/Quota."
-        st.error(msg)
-    except Exception as e: logger.error(f"Unexpected error resolving '{identifier}': {e}", exc_info=True); st.error(f"Error: {e}")
-    return None
+            if channel_id:
+                logger.info(f"Resolved '{identifier}' via search to '{found_title}' ({channel_id})")
+                return channel_id
+            else:
+                logger.warning(f"Search succeeded but no channelId found for '{identifier}'.")
+                return None # API item had no channelId
+        else: logger.warning(f"API search returned no items for '{identifier}'.")
+    except ValueError as e: st.error(f"API Key Error: {e}")
+    except Exception as e: logger.error(f"Resolution error for '{identifier}': {e}", exc_info=True); st.error(f"Channel resolution error.")
+    return None  # Fallback
 
 # --- Folder Management UI ---
 def show_channel_folder_manager():
-    # Simplified UI structure
     st.write("#### Manage Channel Folders")
-    folders = load_channel_folders(); folder_keys = list(folders.keys())
+    folders = load_channel_folders()
+    folder_keys = list(folders.keys())
     action = st.radio("Action:", ["Add", "Remove", "Create", "Delete"], key="fldr_action_radio", horizontal=True)
 
     if action == "Create":
@@ -376,7 +391,7 @@ def show_channel_folder_manager():
              with st.form("create_form"):
                   new_name = st.text_input("Folder Name:").strip()
                   if st.form_submit_button("Create"):
-                      if not new_name: st.error("Name empty.")
+                      if not new_name: st.error("Folder name cannot be empty.")
                       elif new_name in folders: st.error("Name exists.")
                       else: folders[new_name] = []; save_channel_folders(folders); st.success("Created!"); st.rerun()
     elif action == "Delete":
@@ -398,7 +413,7 @@ def show_channel_folder_manager():
                                cid = get_channel_id(line)
                                if cid and cid not in current_ids:
                                    cname = line;
-                                   try: d=requests.get(f"https://...channels?part=snippet&id={cid}&key={get_youtube_api_key()}", timeout=5).json(); cname=d['items'][0]['snippet']['title'] if d.get('items') else line
+                                   try: d=requests.get(f"https://www.googleapis.com/youtube/v3/channels?part=snippet&id={cid}&key={get_youtube_api_key()}", timeout=5).json(); cname=d['items'][0]['snippet']['title'] if d.get('items') else line
                                    except Exception: pass
                                    folders[f_add].append({"channel_name": cname, "channel_id": cid}); current_ids.add(cid); added+=1
                                elif cid: st.warning(f"'{line}' already in folder.")
@@ -422,7 +437,7 @@ def show_channel_folder_manager():
 # 6. Transcript & Fallback (Corrected `finally` block)
 # =============================================================================
 def get_transcript(video_id):
-    """Fetches YouTube transcript if library available."""
+    """Gets YouTube transcript if library available."""
     if not YOUTUBE_LIBS_AVAILABLE: return None
     try:
         t_list = YouTubeTranscriptApi.list_transcripts(video_id)
@@ -434,7 +449,7 @@ def get_transcript(video_id):
         logger.info(f"Found transcript ({transcript.language}) for {video_id}")
         return transcript.fetch()
     except (TranscriptsDisabled, NoTranscriptFound) as e: logger.warning(f"Transcript {video_id}: {e}"); return None
-    except Exception as e: logger.error(f"Transcript error {video_id}: {e}", exc_info=True); return None
+    except Exception as e: logger.error(f"Transcript fetch error {video_id}: {e}", exc_info=True); return None
 
 def download_audio(video_id):
     """Downloads audio using yt-dlp if available."""
@@ -445,7 +460,7 @@ def download_audio(video_id):
         st.error(f"{msg} Cannot download audio."); logger.error(msg); return None, None
 
     try: temp_dir = tempfile.mkdtemp(prefix=f"audio_{video_id}_")
-    except Exception as e: logger.error(f"Create temp dir failed: {e}"); return None, None
+    except Exception as e: logger.error(f"Failed create temp dir: {e}"); return None, None
 
     safe_id = re.sub(r'[^\w-]', '', video_id); out_tmpl = os.path.join(temp_dir, f"{safe_id}.%(ext)s")
     expected_mp3 = os.path.join(temp_dir, f"{safe_id}.mp3")
@@ -453,18 +468,15 @@ def download_audio(video_id):
                 'outtmpl': out_tmpl, 'quiet': True, 'no_warnings': True, 'noprogress': True, 'ffmpeg_location': ffmpeg_path, 'socket_timeout': 60, 'ignoreconfig': True}
 
     try:
-        logger.info(f"Downloading audio {video_id}...");
+        logger.info(f"Downloading audio for {video_id}...");
         with YoutubeDL(ydl_opts) as ydl: ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
         if os.path.exists(expected_mp3): logger.info(f"Audio OK: {expected_mp3}"); return expected_mp3, temp_dir
-        else: # Check alternatives if mp3 failed
+        else: # Check for other formats if mp3 conversion failed
             found = [f for f in os.listdir(temp_dir) if f.startswith(safe_id) and f.split('.')[-1] in ['m4a', 'opus', 'ogg', 'wav']]
             if found: alt = os.path.join(temp_dir, found[0]); logger.warning(f"Using alt audio: {alt}"); return alt, temp_dir
             else: raise FileNotFoundError("No audio file found after download")
-    except (YTDLP_DownloadError, FileNotFoundError) as e: logger.error(f"Audio DL Error {video_id}: {e}"); st.error(f"Audio download failed: {e}")
-    except Exception as e: logger.error(f"Audio DL Unexpected {video_id}: {e}", exc_info=True); st.error(f"Audio download error: {e}")
-    # Cleanup on error
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    return None, None
+    except (YTDLP_DownloadError, FileNotFoundError) as e: logger.error(f"Audio DL Error {video_id}: {e}"); st.error(f"Audio download failed: {e}"); shutil.rmtree(temp_dir); return None, None
+    except Exception as e: logger.error(f"Audio DL Unexpected {video_id}: {e}", exc_info=True); st.error(f"Audio download error: {e}"); shutil.rmtree(temp_dir); return None, None
 
 def generate_transcript_with_openai(audio_file):
     """Generates transcript using Whisper if available."""
@@ -474,7 +486,7 @@ def generate_transcript_with_openai(audio_file):
     except OSError as e: logger.error(f"Cannot access {audio_file}: {e}"); return None, None
 
     if size > max_size:
-        st.info(f"Audio large ({size/(1<<20):.1f}MB), snippeting..."); logger.warning(f"Audio {audio_file} > 25MB, snippeting.")
+        st.info(f"Audio large ({size/(1<<20):.1f}MB), snippeting..."); logger.warning(f"Audio {audio_file} > 25MB, creating snippet.")
         base, ext = os.path.splitext(audio_file); snippet_file = f"{base}_snippet{ext}"
         max_dur = int((max_size * 0.9) / (16 * 1024)); snippet_dur = min(max_dur, 20*60)
         cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", audio_file, "-t", str(snippet_dur), "-c:a", "libmp3lame", "-b:a", "128k", snippet_file]
@@ -489,8 +501,9 @@ def generate_transcript_with_openai(audio_file):
             client = openai.OpenAI(api_key=OPENAI_API_KEY)
             response = client.audio.transcriptions.create(model="whisper-1", file=f)
             text = response.text
-        dur_est = snippet_dur if snippet_dur > 0 else (size/(16*1024))
-        segments = [{"start": 0.0, "duration": dur_est, "text": text or ""}]
+        logger.info("Whisper transcription successful.")
+        duration_est = snippet_dur if snippet_dur > 0 else (size/(16*1024))
+        segments = [{"start": 0.0, "duration": duration_est, "text": text or ""}]
         return segments, "openai_whisper"
     except OpenAI_APIError as e: logger.error(f"Whisper API error: {e}"); st.error(f"Whisper API Error: {e}"); return None, None
     except Exception as e: logger.error(f"Whisper unexpected error: {e}", exc_info=True); st.error(f"Whisper error: {e}"); return None, None
@@ -499,128 +512,10 @@ def generate_transcript_with_openai(audio_file):
             try: os.remove(snippet_file); logger.info(f"Removed snippet: {snippet_file}")
             except OSError as e: logger.warning(f"Failed remove snippet {snippet_file}: {e}")
 
-# --- CORRECTED get_transcript_with_fallback ---
+# --- Corrected get_transcript_with_fallback function ---
 def get_transcript_with_fallback(video_id):
     """Gets YouTube transcript, falls back to Whisper if needed and possible."""
     cache_key_data = f"transcript_data_{video_id}"
     cache_key_source = f"transcript_source_{video_id}"
     if cache_key_data in st.session_state:
-        return st.session_state[cache_key_data], st.session_state[cache_key_source]
-
-    # 1. Try YouTube
-    yt_transcript = get_transcript(video_id)
-    if yt_transcript:
-        st.session_state[cache_key_data] = yt_transcript
-        st.session_state[cache_key_source] = "youtube"
-        return yt_transcript, "youtube"
-
-    # 2. Try Whisper fallback
-    logger.warning(f"YT transcript failed {video_id}, trying Whisper.")
-    if not openai or not OPENAI_API_KEY or not YOUTUBE_LIBS_AVAILABLE:
-        st.info("YT transcript unavailable. Whisper fallback not possible (check config/libs).")
-        st.session_state[cache_key_data] = None; st.session_state[cache_key_source] = None
-        return None, None
-
-    st_placeholder = st.info("Downloading audio for Whisper fallback...")
-    audio_path = None
-    temp_dir = None
-    whisper_transcript = None
-    whisper_source = None
-
-    try:
-        audio_path, temp_dir = download_audio(video_id) # Assign result correctly
-
-        if audio_path and temp_dir:
-            st_placeholder.info("Audio downloaded. Transcribing with Whisper (this may take time)...")
-            logger.info(f"Audio downloaded for {video_id} to {audio_path}. Proceeding with Whisper.")
-            whisper_transcript, whisper_source = generate_transcript_with_openai(audio_path)
-
-            if whisper_transcript:
-                st_placeholder.success("Whisper transcription successful.")
-                logger.info(f"Whisper transcription successful for {video_id}.")
-            else:
-                st_placeholder.error("Whisper transcription failed.")
-                logger.error(f"Whisper transcription failed for {video_id}.")
-        else:
-            st_placeholder.error("Audio download failed. Cannot perform Whisper transcription.")
-            logger.error(f"Audio download failed for {video_id}, cannot use Whisper fallback.")
-
-    finally:
-         # Always clean up the audio temp directory if it was created
-         # Use the correct variable name 'temp_dir'
-         if temp_dir and os.path.exists(temp_dir): # Check if dir exists
-              try: # Start try on a NEW LINE, indented
-                  logger.info(f"Cleaning up audio temp directory: {temp_dir}")
-                  shutil.rmtree(temp_dir)
-              except Exception as e: # Indent except accordingly
-                  logger.error(f"Failed to clean up audio temp directory {temp_dir}: {e}")
-
-    # Store results (or lack thereof) in session state
-    st.session_state[cache_key_data] = whisper_transcript
-    st.session_state[cache_key_source] = whisper_source
-    # Check if placeholder exists before using (might fail during init)
-    if 'st_placeholder' in locals() and isinstance(st_placeholder, st.delta_generator.DeltaGenerator):
-        try: st_placeholder.empty()
-        except Exception: pass # Ignore errors clearing placeholder if already gone
-    return whisper_transcript, whisper_source
-# --- END CORRECTED FUNCTION ---
-
-# =============================================================================
-# 7. AI Summarization (Functions kept from prev step)
-# =============================================================================
-# get_intro_outro_transcript, summarize_intro_outro, summarize_script
-
-# =============================================================================
-# 8. Searching & Calculating Outliers (Functions kept from prev step)
-# =============================================================================
-# chunk_list, calculate_metrics, fetch_all_snippets, search_youtube
-
-# =============================================================================
-# 9. Comments & Analysis (Functions kept from prev step)
-# =============================================================================
-# analyze_comments, get_video_comments
-
-# =============================================================================
-# 10. Retention Analysis (Functions kept from prev step)
-# =============================================================================
-# check_selenium_setup, load_cookies, capture_player_screenshot_with_hover,
-# detect_retention_peaks, capture_frame_at_time, plot_brightness_profile,
-# filter_transcript, check_ytdlp_installed, download_video_snippet
-
-# =============================================================================
-# 14. UI Pages (Functions kept from prev step)
-# =============================================================================
-# show_search_page, show_details_page
-
-# =============================================================================
-# Main App Logic
-# =============================================================================
-def main():
-    """Main Streamlit execution function."""
-    if 'db_initialized' not in st.session_state:
-         if not DB_CONN_PATH: # Check if DB init failed
-              st.error("Database failed to initialize. Application cannot continue.")
-              st.stop() # Stop execution if DB is essential
-         st.session_state.db_initialized = True
-    if "page" not in st.session_state: st.session_state.page = "search"
-    page = st.session_state.get("page")
-    if page == "search": show_search_page()
-    elif page == "details": show_details_page()
-    else: st.session_state.page = "search"; show_search_page() # Default
-
-def app_shutdown(): logger.info("======== App Shutdown ========")
-
-if __name__ == "__main__":
-    # Set page config as the absolute first command
-    st.set_page_config(page_title="YouTube Niche Analysis", layout="wide", page_icon="📊")
-    # Check essential libs early after config
-    if not YOUTUBE_LIBS_AVAILABLE:
-        st.error("Core YouTube libraries missing. Please install them. App halted.")
-        st.stop() # Stop if core libs missing
-    try: main()
-    except Exception as e:
-        logger.critical(f"FATAL: Unhandled exception: {e}", exc_info=True)
-        st.error(f"A critical application error occurred: {e}. Please check logs or restart.")
-    finally: atexit.register(app_shutdown)
-
-# --- END OF FILE ---
+        return st.
